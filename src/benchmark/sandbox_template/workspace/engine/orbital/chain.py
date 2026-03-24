@@ -12,7 +12,6 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Tuple, Union
 
-import requests
 
 from engine.models import Satellite, Station
 from engine.orbital.propagation import propagate_satellite

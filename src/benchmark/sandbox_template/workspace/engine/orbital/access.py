@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-import requests
 from datetime import datetime
 from typing import Iterable, List, Dict, Any, Optional, Union
+
+import requests
 
 from ..models import (
     Satellite,
@@ -15,6 +16,7 @@ from ..models import (
     RangeConstraint,
     ElevationAngleConstraint,
 )
+from ..http import post_with_retry
 
 ASTROX_API_URL = "http://astrox.cn:8765"
 
@@ -161,10 +163,9 @@ def compute_accessibility(
     )
 
     try:
-        response = requests.post(
+        response = post_with_retry(
             f"{ASTROX_API_URL}/access/AccessComputeV2", json=payload, timeout=60
         )
-        response.raise_for_status()
     except requests.exceptions.RequestException as e:
         raise AstroxAPIError(f"Astrox API request failed: {e}") from e
 

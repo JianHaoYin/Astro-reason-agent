@@ -2,13 +2,14 @@
 Computes satellite lighting conditions using the Astrox API.
 """
 
-import requests
 from datetime import datetime
 from typing import List, Dict, Any
 
-from ..models import Satellite, LightingWindow, LightingCondition
+import requests
 
-# TODO: Move to a configuration file
+from ..models import Satellite, LightingWindow, LightingCondition
+from ..http import post_with_retry
+
 ASTROX_API_URL = "http://astrox.cn:8765"
 
 
@@ -60,10 +61,9 @@ def compute_lighting_windows(
     payload = _build_lighting_payload(satellite, start_time, end_time)
 
     try:
-        response = requests.post(
+        response = post_with_retry(
             f"{ASTROX_API_URL}/Lighting/LightingTimes", json=payload, timeout=60
         )
-        response.raise_for_status()
     except requests.exceptions.RequestException as e:
         raise AstroxAPIError(f"Astrox API request failed: {e}") from e
 

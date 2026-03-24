@@ -1,0 +1,8 @@
+Use the mission brief below and the available tools to produce a valid plan.
+
+Mission brief:
+```md
+{mission_brief}
+```
+
+You must use tools to build and commit the plan.

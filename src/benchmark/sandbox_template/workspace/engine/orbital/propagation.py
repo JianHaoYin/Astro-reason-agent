@@ -4,13 +4,15 @@ Satellite orbit propagation and state vector interpolation.
 
 from __future__ import annotations
 
+import bisect
 import math
 from datetime import datetime, timezone, timedelta
 from typing import List, Tuple, Dict, Optional
-import requests
-import bisect
 
-# TODO: Move to a configuration file
+import requests
+
+from engine.http import post_with_retry
+
 ASTROX_HOST = "http://astrox.cn:8765"
 
 
@@ -124,8 +126,7 @@ def propagate_satellite(
     }
     
     try:
-        resp = requests.post(f"{ASTROX_HOST}/Propagator/Sgp4", json=payload, timeout=30)
-        resp.raise_for_status()
+        resp = post_with_retry(f"{ASTROX_HOST}/Propagator/Sgp4", json=payload, timeout=30)
     except requests.exceptions.RequestException as e:
         raise PropagationError(f"Astrox SGP4 request failed: {e}")
         
