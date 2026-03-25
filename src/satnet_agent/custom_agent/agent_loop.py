@@ -1,4 +1,4 @@
-"""Core agent loop for the local benchmark runner."""
+"""Core agent loop for the local SatNet runner."""
 
 from __future__ import annotations
 
@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from tqdm import tqdm
+
 from .ollama_client import OllamaChatClient
 from .prompts import build_user_prompt, load_system_prompt
 from .tool_profiles import DEFAULT_BENCHMARK_TYPE, render_tool_summary
@@ -16,7 +18,7 @@ from .tools import PlannerToolRegistry, build_tool_specs, get_allowed_tool_names
 
 
 class LocalPlanningAgent:
-    """Very small tool-calling agent loop."""
+    """Very small tool-calling agent loop for SatNet."""
 
     def __init__(self, base_url: str, model: str, timeout: int = 300, max_turns: int = 16):
         self.client = OllamaChatClient(base_url=base_url, model=model, timeout=timeout)
@@ -53,7 +55,6 @@ class LocalPlanningAgent:
         return DEFAULT_BENCHMARK_TYPE
 
     def _message_text(self, message: dict[str, Any]) -> str:
-        """Combine visible content and reasoning for repair heuristics."""
         chunks: list[str] = []
         content = message.get("content") or ""
         reasoning = message.get("reasoning") or ""
@@ -74,14 +75,14 @@ class LocalPlanningAgent:
     def _build_repair_message(self, mode: str) -> str:
         if mode == "pseudo_tool_call":
             return (
-                "Your previous response attempted to describe a tool call in plain text or reasoning instead of "
-                "returning structured tool_calls. Re-issue the exact next step using actual tool_calls only. "
-                "Do not use XML tags, markdown code blocks, pseudo-tool syntax, or tool names inside reasoning."
+                "Your previous response described a tool call in plain text instead of returning structured tool_calls. "
+                "Re-issue the exact next step using actual tool_calls only. Do not use XML tags, markdown code blocks, "
+                "or pseudo-tool syntax."
             )
         return (
             "Your previous response returned neither usable content nor structured tool_calls, and the task is not "
-            "finished yet. Continue from the current state and return either a real tool call or a short status update "
-            "plus the next real tool call. Do not stop until commit_plan succeeds."
+            "finished yet. Continue from the current SatNet state and return either a real tool call or a short status "
+            "update plus the next real tool call. Do not stop until commit_plan succeeds."
         )
 
     def _run_schedule_phase(
@@ -97,9 +98,9 @@ class LocalPlanningAgent:
             {
                 "role": "user",
                 "content": (
-                    "Before executing any actions, produce a concrete execution schedule in Markdown. "
-                    "Do not call tools in this step. Include a short objective summary and a numbered "
-                    "list of planned observations/downlinks with asset names, rough timing, and intent."
+                    "Before executing any actions, produce a concrete scheduling plan in Markdown. "
+                    "Do not call tools in this step. Include a short objective summary and a numbered list of intended "
+                    "request allocations, likely antennas, and why those choices should reduce unmet demand fairly."
                 ),
             }
         )
@@ -120,7 +121,7 @@ class LocalPlanningAgent:
 
         reasoning = message.get("reasoning") or ""
         if isinstance(reasoning, str) and reasoning.strip():
-            self._append_parsed_log(parsed_log_path, "ASSISTANT", f"🧠 [思考过程]:\n{reasoning.strip()}")
+            self._append_parsed_log(parsed_log_path, "ASSISTANT", f"[Reasoning]\n{reasoning.strip()}")
 
         schedule_text = (message.get("content") or "").strip()
         self._append_parsed_log(parsed_log_path, "ASSISTANT", schedule_text or "No schedule proposed.")
@@ -143,7 +144,7 @@ class LocalPlanningAgent:
         parsed_log_path = logs_dir / "agent_parsed_log.txt"
         parsed_log_path.write_text(
             "============================================================\n"
-            "AstroReason-Bench 代理执行日志 (Agent Log)\n"
+            "SatNet Local Agent Log\n"
             "============================================================\n\n",
             encoding="utf-8",
         )
@@ -178,9 +179,8 @@ class LocalPlanningAgent:
             {
                 "role": "user",
                 "content": (
-                    "Execute the schedule above using the tools. Follow it closely. "
-                    "If a planned step is infeasible, explain the adjustment briefly, then continue. "
-                    "Finish only after commit_plan succeeds."
+                    "Execute the scheduling plan above using the tools. Follow it closely. If a planned allocation is "
+                    "infeasible, explain the adjustment briefly, then continue. Finish only after commit_plan succeeds."
                 ),
             }
         )
@@ -189,100 +189,106 @@ class LocalPlanningAgent:
         repair_attempts = 0
         max_repair_attempts = 3
 
-        for turn in range(1, self.max_turns + 1):
-            request_payload = {
-                "turn": turn,
-                "messages": messages,
-                "tools": tools,
-            }
-            self._append_jsonl(model_requests_path, request_payload)
+        with tqdm(total=self.max_turns, desc="Agent turns", unit="turn") as turn_progress:
+            for turn in range(1, self.max_turns + 1):
+                turn_progress.set_postfix(turn=turn)
 
-            response = self.client.create_chat_completion(messages=messages, tools=tools)
-            self._append_jsonl(model_responses_path, {"turn": turn, "response": response})
-
-            message = response["choices"][0]["message"]
-            transcript.append({"turn": turn, "assistant": message})
-
-            reasoning = message.get("reasoning") or ""
-            if isinstance(reasoning, str) and reasoning.strip():
-                self._append_parsed_log(parsed_log_path, "ASSISTANT", f"🧠 [思考过程]:\n{reasoning.strip()}")
-
-            content = message.get("content") or ""
-            if isinstance(content, str) and content.strip():
-                final_text = content.strip()
-                self._append_parsed_log(parsed_log_path, "ASSISTANT", final_text)
-
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": message.get("content", ""),
-                    "tool_calls": message.get("tool_calls", []),
-                }
-            )
-
-            tool_calls = message.get("tool_calls") or []
-            if not tool_calls:
-                pseudo_tool_call = self._tool_call_repair_needed(message, tool_name_set)
-                empty_message = not self._message_text(message).strip()
-
-                if not committed and repair_attempts < max_repair_attempts and (pseudo_tool_call or empty_message):
-                    repair_attempts += 1
-                    repair_mode = "pseudo_tool_call" if pseudo_tool_call else "empty_response"
-                    repair_message = self._build_repair_message(repair_mode)
-                    messages.append({"role": "user", "content": repair_message})
-                    self._append_parsed_log(parsed_log_path, "USER", repair_message)
-                    stop_reason = repair_mode
-                    continue
-
-                if committed:
-                    stop_reason = "committed"
-                elif pseudo_tool_call:
-                    stop_reason = "pseudo_tool_call_repair_exhausted"
-                elif empty_message:
-                    stop_reason = "empty_response_repair_exhausted"
-                else:
-                    stop_reason = "no_tool_calls"
-                break
-
-            repair_attempts = 0
-
-            for tool_call in tool_calls:
-                function_name = tool_call["function"]["name"]
-                raw_arguments = tool_call["function"].get("arguments") or "{}"
-                arguments = json.loads(raw_arguments)
-                self._append_parsed_log(
-                    parsed_log_path,
-                    "ASSISTANT",
-                    f"🛠️ [调用工具 -> {function_name}]:\n参数: {self._format_json(arguments)}",
-                )
-
-                result = registry.invoke(function_name, arguments)
-
-                tool_event = {
+                request_payload = {
                     "turn": turn,
-                    "tool_call_id": tool_call["id"],
-                    "tool_name": function_name,
-                    "tool_arguments": arguments,
-                    "tool_result": result,
+                    "messages": messages,
+                    "tools": tools,
                 }
-                self._append_jsonl(tool_calls_path, tool_event)
-                transcript.append(tool_event)
-                self._append_parsed_log(parsed_log_path, "USER", f"✅ [工具返回结果]:\n{self._format_json(result)}")
+                self._append_jsonl(model_requests_path, request_payload)
 
-                if function_name == "commit_plan" and isinstance(result, dict) and result.get("valid"):
-                    committed = True
-                    stop_reason = "committed"
+                response = self.client.create_chat_completion(messages=messages, tools=tools)
+                self._append_jsonl(model_responses_path, {"turn": turn, "response": response})
+
+                message = response["choices"][0]["message"]
+                transcript.append({"turn": turn, "assistant": message})
+
+                reasoning = message.get("reasoning") or ""
+                if isinstance(reasoning, str) and reasoning.strip():
+                    self._append_parsed_log(parsed_log_path, "ASSISTANT", f"[Reasoning]\n{reasoning.strip()}")
+
+                content = message.get("content") or ""
+                if isinstance(content, str) and content.strip():
+                    final_text = content.strip()
+                    self._append_parsed_log(parsed_log_path, "ASSISTANT", final_text)
 
                 messages.append(
                     {
-                        "role": "tool",
-                        "tool_call_id": tool_call["id"],
-                        "content": json.dumps(result, ensure_ascii=False),
+                        "role": "assistant",
+                        "content": message.get("content", ""),
+                        "tool_calls": message.get("tool_calls", []),
                     }
                 )
 
-            if committed:
-                break
+                tool_calls = message.get("tool_calls") or []
+                if not tool_calls:
+                    pseudo_tool_call = self._tool_call_repair_needed(message, tool_name_set)
+                    empty_message = not self._message_text(message).strip()
+
+                    if not committed and repair_attempts < max_repair_attempts and (pseudo_tool_call or empty_message):
+                        repair_attempts += 1
+                        repair_mode = "pseudo_tool_call" if pseudo_tool_call else "empty_response"
+                        repair_message = self._build_repair_message(repair_mode)
+                        messages.append({"role": "user", "content": repair_message})
+                        self._append_parsed_log(parsed_log_path, "USER", repair_message)
+                        stop_reason = repair_mode
+                        turn_progress.update(1)
+                        continue
+
+                    if committed:
+                        stop_reason = "committed"
+                    elif pseudo_tool_call:
+                        stop_reason = "pseudo_tool_call_repair_exhausted"
+                    elif empty_message:
+                        stop_reason = "empty_response_repair_exhausted"
+                    else:
+                        stop_reason = "no_tool_calls"
+                    turn_progress.update(1)
+                    break
+
+                repair_attempts = 0
+
+                for tool_call in tool_calls:
+                    function_name = tool_call["function"]["name"]
+                    raw_arguments = tool_call["function"].get("arguments") or "{}"
+                    arguments = json.loads(raw_arguments)
+                    self._append_parsed_log(
+                        parsed_log_path,
+                        "ASSISTANT",
+                        f"[Tool -> {function_name}]\nArguments: {self._format_json(arguments)}",
+                    )
+
+                    result = registry.invoke(function_name, arguments)
+
+                    tool_event = {
+                        "turn": turn,
+                        "tool_call_id": tool_call["id"],
+                        "tool_name": function_name,
+                        "tool_arguments": arguments,
+                        "tool_result": result,
+                    }
+                    self._append_jsonl(tool_calls_path, tool_event)
+                    transcript.append(tool_event)
+                    self._append_parsed_log(parsed_log_path, "TOOL", self._format_json(result))
+
+                    if function_name == "commit_plan" and isinstance(result, dict) and result.get("valid"):
+                        committed = True
+                        stop_reason = "committed"
+
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call["id"],
+                            "content": json.dumps(result, ensure_ascii=False),
+                        }
+                    )
+
+                turn_progress.update(1)
+                if committed:
+                    break
 
         transcript_path = output_dir / "agent_transcript.json"
         transcript_path.write_text(json.dumps(transcript, indent=2, ensure_ascii=False), encoding="utf-8")
