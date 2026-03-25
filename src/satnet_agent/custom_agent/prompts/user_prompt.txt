@@ -1,8 +1,13 @@
-Use the mission brief below and the available tools to produce a valid DSN schedule.
+Use the mission brief below and the available tools to produce a valid plan.
+
+Benchmark type: `{benchmark_type}`
+
+Available tools for this task:
+{tool_summary}
 
 Mission brief:
 ```md
 {mission_brief}
 ```
 
-You must use tools to build and commit the schedule.
+You must use tools to build and commit the plan. Only call tools that are actually available above.

@@ -21,6 +21,10 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
+from runtime_requirements import require_python_312
+
+require_python_312()
+
 from benchmark.custom_agent.agent_loop import LocalPlanningAgent  # noqa: E402
 from benchmark.run_benchmark import extract_key_metrics, score_result, setup_sandbox  # noqa: E402
 

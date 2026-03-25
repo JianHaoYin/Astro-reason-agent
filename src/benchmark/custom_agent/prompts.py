@@ -10,7 +10,11 @@ def load_system_prompt() -> str:
     return (PROMPT_DIR / "system_prompt.txt").read_text(encoding="utf-8")
 
 
-def build_user_prompt(mission_brief: str) -> str:
-    """Render the user prompt with the case-specific mission brief."""
+def build_user_prompt(mission_brief: str, benchmark_type: str, tool_summary: str) -> str:
+    """Render the user prompt with the mission brief and available tool summary."""
     template = (PROMPT_DIR / "user_prompt.txt").read_text(encoding="utf-8")
-    return template.format(mission_brief=mission_brief)
+    return template.format(
+        mission_brief=mission_brief,
+        benchmark_type=benchmark_type,
+        tool_summary=tool_summary,
+    )

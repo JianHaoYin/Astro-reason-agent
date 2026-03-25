@@ -11,25 +11,18 @@ from typing import Any
 
 from .ollama_client import OllamaChatClient
 from .prompts import build_user_prompt, load_system_prompt
-from .tools import SatNetToolRegistry, build_tool_specs
+from .tool_profiles import DEFAULT_BENCHMARK_TYPE, render_tool_summary
+from .tools import PlannerToolRegistry, build_tool_specs, get_allowed_tool_names
 
 
 class LocalPlanningAgent:
-    """Very small tool-calling agent loop.
-
-    The design goal here is simplicity:
-    - one model
-    - one conversation
-    - local tools only
-    - stop after a valid commit or when turns are exhausted
-    """
+    """Very small tool-calling agent loop."""
 
     def __init__(self, base_url: str, model: str, timeout: int = 300, max_turns: int = 16):
         self.client = OllamaChatClient(base_url=base_url, model=model, timeout=timeout)
         self.max_turns = max_turns
 
     def _append_jsonl(self, path: Path, payload: dict[str, Any]) -> None:
-        """Append one JSON object per line for easy incremental debugging."""
         with path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
@@ -46,25 +39,50 @@ class LocalPlanningAgent:
     def _format_json(self, payload: Any) -> str:
         return json.dumps(payload, ensure_ascii=False, indent=2)
 
-    def _tool_call_repair_needed(self, message: dict[str, Any]) -> bool:
+    def _load_benchmark_type(self, sandbox_dir: Path) -> str:
+        manifest_path = sandbox_dir / "data" / "manifest.json"
+        if not manifest_path.exists():
+            return DEFAULT_BENCHMARK_TYPE
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return DEFAULT_BENCHMARK_TYPE
+        benchmark_type = manifest.get("benchmark_type")
+        if isinstance(benchmark_type, str) and benchmark_type.strip():
+            return benchmark_type
+        return DEFAULT_BENCHMARK_TYPE
+
+    def _message_text(self, message: dict[str, Any]) -> str:
+        """Combine visible content and reasoning for repair heuristics."""
+        chunks: list[str] = []
         content = message.get("content") or ""
-        if not isinstance(content, str) or not content.strip():
+        reasoning = message.get("reasoning") or ""
+        if isinstance(content, str) and content.strip():
+            chunks.append(content)
+        if isinstance(reasoning, str) and reasoning.strip():
+            chunks.append(reasoning)
+        return "\n".join(chunks)
+
+    def _tool_call_repair_needed(self, message: dict[str, Any], tool_names: set[str]) -> bool:
+        text = self._message_text(message)
+        if not text.strip():
             return False
-        if "<tool_call>" in content or "<function=" in content:
+        if "<tool_call>" in text or "<function=" in text:
             return True
-        known_tools = {
-            "query_satellites",
-            "query_targets",
-            "query_stations",
-            "compute_access_windows",
-            "query_windows",
-            "stage_action",
-            "get_plan_status",
-            "commit_plan",
-            "evaluate_revisit_gaps",
-            "wait",
-        }
-        return any(re.search(rf"\b{name}\s*\(", content) for name in known_tools)
+        return any(re.search(rf"\b{re.escape(name)}\s*\(", text) for name in tool_names)
+
+    def _build_repair_message(self, mode: str) -> str:
+        if mode == "pseudo_tool_call":
+            return (
+                "Your previous response attempted to describe a tool call in plain text or reasoning instead of "
+                "returning structured tool_calls. Re-issue the exact next step using actual tool_calls only. "
+                "Do not use XML tags, markdown code blocks, pseudo-tool syntax, or tool names inside reasoning."
+            )
+        return (
+            "Your previous response returned neither usable content nor structured tool_calls, and the task is not "
+            "finished yet. Continue from the current state and return either a real tool call or a short status update "
+            "plus the next real tool call. Do not stop until commit_plan succeeds."
+        )
 
     def _run_schedule_phase(
         self,
@@ -74,16 +92,17 @@ class LocalPlanningAgent:
         transcript: list[dict[str, Any]],
         parsed_log_path: Path,
     ) -> tuple[str, list[dict[str, Any]]]:
-        """Ask the model to propose a concrete schedule before execution begins."""
         planning_messages = deepcopy(messages)
-        planning_messages.append({
-            "role": "user",
-            "content": (
-                "Before executing any actions, produce a concrete execution schedule in Markdown. "
-                "Do not call tools in this step. Include a short objective summary and a numbered "
-                "list of planned observations/downlinks with asset names, rough timing, and intent."
-            ),
-        })
+        planning_messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "Before executing any actions, produce a concrete execution schedule in Markdown. "
+                    "Do not call tools in this step. Include a short objective summary and a numbered "
+                    "list of planned observations/downlinks with asset names, rough timing, and intent."
+                ),
+            }
+        )
         self._append_parsed_log(parsed_log_path, "USER", planning_messages[-1]["content"])
 
         request_payload = {
@@ -108,10 +127,12 @@ class LocalPlanningAgent:
         return schedule_text, planning_messages
 
     def run(self, sandbox_dir: Path, output_dir: Path) -> dict[str, Any]:
-        """Run the agent on one prepared benchmark sandbox."""
         mission_brief = (sandbox_dir / "workspace" / "mission_brief.md").read_text(encoding="utf-8")
-        registry = SatNetToolRegistry(sandbox_dir)
-        tools = build_tool_specs()
+        benchmark_type = self._load_benchmark_type(sandbox_dir)
+        allowed_tool_names = get_allowed_tool_names(benchmark_type)
+        registry = PlannerToolRegistry(sandbox_dir, allowed_tools=allowed_tool_names)
+        tools = build_tool_specs(benchmark_type)
+        tool_name_set = set(allowed_tool_names)
 
         logs_dir = output_dir / "logs"
         logs_dir.mkdir(parents=True, exist_ok=True)
@@ -128,7 +149,8 @@ class LocalPlanningAgent:
         )
 
         system_prompt = load_system_prompt()
-        user_prompt = build_user_prompt(mission_brief)
+        tool_summary = render_tool_summary(benchmark_type)
+        user_prompt = build_user_prompt(mission_brief, benchmark_type, tool_summary)
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
@@ -138,6 +160,7 @@ class LocalPlanningAgent:
         transcript: list[dict[str, Any]] = []
         final_text = ""
         committed = False
+        stop_reason = "max_turns_exhausted"
 
         proposed_schedule, planning_messages = self._run_schedule_phase(
             messages=messages,
@@ -150,21 +173,21 @@ class LocalPlanningAgent:
         proposed_schedule_path.write_text(proposed_schedule or "No schedule proposed.", encoding="utf-8")
 
         messages = planning_messages
-        messages.append({
-            "role": "assistant",
-            "content": proposed_schedule,
-        })
-        messages.append({
-            "role": "user",
-            "content": (
-                "Execute the schedule above using the tools. Follow it closely. "
-                "If a planned step is infeasible, explain the adjustment briefly, then continue. "
-                "Finish only after commit_plan succeeds."
-            ),
-        })
+        messages.append({"role": "assistant", "content": proposed_schedule})
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "Execute the schedule above using the tools. Follow it closely. "
+                    "If a planned step is infeasible, explain the adjustment briefly, then continue. "
+                    "Finish only after commit_plan succeeds."
+                ),
+            }
+        )
         self._append_parsed_log(parsed_log_path, "USER", messages[-1]["content"])
 
         repair_attempts = 0
+        max_repair_attempts = 3
 
         for turn in range(1, self.max_turns + 1):
             request_payload = {
@@ -189,24 +212,36 @@ class LocalPlanningAgent:
                 final_text = content.strip()
                 self._append_parsed_log(parsed_log_path, "ASSISTANT", final_text)
 
-            messages.append({
-                "role": "assistant",
-                "content": message.get("content", ""),
-                "tool_calls": message.get("tool_calls", []),
-            })
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": message.get("content", ""),
+                    "tool_calls": message.get("tool_calls", []),
+                }
+            )
 
             tool_calls = message.get("tool_calls") or []
             if not tool_calls:
-                if not committed and repair_attempts < 2 and self._tool_call_repair_needed(message):
+                pseudo_tool_call = self._tool_call_repair_needed(message, tool_name_set)
+                empty_message = not self._message_text(message).strip()
+
+                if not committed and repair_attempts < max_repair_attempts and (pseudo_tool_call or empty_message):
                     repair_attempts += 1
-                    repair_message = (
-                        "Your previous response described a tool invocation in plain text instead of returning "
-                        "structured tool_calls. Re-issue the exact next step using actual tool calls only. "
-                        "Do not use XML tags, markdown code blocks, or pseudo-tool syntax."
-                    )
+                    repair_mode = "pseudo_tool_call" if pseudo_tool_call else "empty_response"
+                    repair_message = self._build_repair_message(repair_mode)
                     messages.append({"role": "user", "content": repair_message})
                     self._append_parsed_log(parsed_log_path, "USER", repair_message)
+                    stop_reason = repair_mode
                     continue
+
+                if committed:
+                    stop_reason = "committed"
+                elif pseudo_tool_call:
+                    stop_reason = "pseudo_tool_call_repair_exhausted"
+                elif empty_message:
+                    stop_reason = "empty_response_repair_exhausted"
+                else:
+                    stop_reason = "no_tool_calls"
                 break
 
             repair_attempts = 0
@@ -236,12 +271,15 @@ class LocalPlanningAgent:
 
                 if function_name == "commit_plan" and isinstance(result, dict) and result.get("valid"):
                     committed = True
+                    stop_reason = "committed"
 
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call["id"],
-                    "content": json.dumps(result, ensure_ascii=False),
-                })
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call["id"],
+                        "content": json.dumps(result, ensure_ascii=False),
+                    }
+                )
 
             if committed:
                 break
@@ -262,11 +300,14 @@ class LocalPlanningAgent:
         conversation_path.write_text(
             json.dumps(
                 {
+                    "benchmark_type": benchmark_type,
                     "system_prompt": system_prompt,
                     "user_prompt": user_prompt,
+                    "available_tools": allowed_tool_names,
                     "proposed_schedule": proposed_schedule,
                     "final_messages": messages,
                     "committed": committed,
+                    "stop_reason": stop_reason,
                     "final_text": final_text,
                 },
                 indent=2,
@@ -276,7 +317,9 @@ class LocalPlanningAgent:
         )
 
         return {
+            "benchmark_type": benchmark_type,
             "committed": committed,
+            "stop_reason": stop_reason,
             "plan_path": str(registry.output_path),
             "proposed_schedule_path": str(proposed_schedule_path),
             "summary_path": str(summary_path),

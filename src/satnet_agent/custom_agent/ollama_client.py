@@ -1,4 +1,8 @@
-"""Minimal Ollama OpenAI-compatible chat client."""
+"""Minimal Ollama OpenAI-compatible chat client.
+
+This module intentionally uses the Python standard library so the benchmark
+runner does not depend on extra HTTP client packages.
+"""
 
 from __future__ import annotations
 
@@ -18,6 +22,7 @@ class OllamaChatClient:
         self.temperature = temperature
 
     def create_chat_completion(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> dict[str, Any]:
+        """Send one non-streaming chat completion request to the local Ollama server."""
         payload = {
             "model": self.model,
             "messages": messages,

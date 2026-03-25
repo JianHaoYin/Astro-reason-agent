@@ -59,6 +59,10 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
+from runtime_requirements import require_python_312
+
+require_python_312()
+
 SANDBOX_TEMPLATE = Path(__file__).parent / "sandbox_template"
 BENCHMARK_DATA_DIR = Path(__file__).parent.parent / "dataset"
 

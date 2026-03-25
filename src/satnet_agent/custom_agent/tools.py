@@ -1,4 +1,4 @@
-"""Local tool registry for the SatNet planning agent."""
+"""Local tool registry for the benchmark planning agent."""
 
 from __future__ import annotations
 
@@ -7,360 +7,410 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from satnet_agent import (
-    SatNetConflictError,
-    SatNetNotFoundError,
-    SatNetScenario,
-    SatNetValidationError,
+from planner.helpers import (
+    action_key,
+    filter_items,
+    format_plan_status,
+    format_satellite_summary,
+    paginate,
+    record_matches_filters,
+    satellite_filter_key,
+    satellite_summary_key,
+    station_key,
+    strip_key,
+    target_key,
+    to_llm_dict,
+    window_filter_key,
+    window_summary_key,
 )
-from satnet_agent.state import SatNetStateFile
+from planner.models import ConflictError, ResourceViolationError, ValidationError
+from planner.scenario import Scenario
+from planner.state import StateFile
+
+from .tool_profiles import build_tool_specs, get_allowed_tool_names
 
 
-class SatNetToolRegistry:
-    """Minimal in-process tool surface for the local SatNet planning agent."""
+class PlannerToolRegistry:
+    """Benchmark-local planner tools with benchmark-specific allowlists."""
 
-    def __init__(self, sandbox_dir: Path):
+    def __init__(self, sandbox_dir: Path, allowed_tools: list[str] | None = None):
         self.sandbox_dir = sandbox_dir
-        self.data_dir = sandbox_dir / "data"
+        self.case_dir = sandbox_dir / "data"
         self.workspace_dir = sandbox_dir / "workspace"
         self.state_path = sandbox_dir / "state" / "scenario.json"
         self.output_path = self.workspace_dir / "plan.json"
-        self.state_file = SatNetStateFile(self.state_path)
+        self.state_file = StateFile(self.state_path)
 
-        self.week = int(os.environ.get("SATNET_WEEK", "40"))
-        self.year = int(os.environ.get("SATNET_YEAR", "2018"))
-        self.problems_path = str(self.data_dir / "problems.json")
-        self.maintenance_path = str(self.data_dir / "maintenance.csv")
+        os.environ["CASE_PATH"] = str(self.case_dir)
+        os.environ["ASTROX_CASE_PATH"] = str(self.case_dir)
+        os.environ["ASTROX_STATE_PATH"] = str(self.state_path)
+        os.environ["ASTROX_OUTPUT_PATH"] = str(self.output_path)
 
-        os.environ["SATNET_STATE_PATH"] = str(self.state_path)
-        os.environ["SATNET_PROBLEMS_PATH"] = self.problems_path
-        os.environ["SATNET_MAINTENANCE_PATH"] = self.maintenance_path
-        os.environ["SATNET_OUTPUT_PATH"] = str(self.output_path)
-        os.environ["SATNET_WEEK"] = str(self.week)
-        os.environ["SATNET_YEAR"] = str(self.year)
+        self.scenario = self._new_scenario()
+        self._persist()
 
-        if not self.state_file.exists():
-            self.state_file.initialize(self.problems_path, self.maintenance_path, self.week, self.year)
-
-        state = self.state_file.read()
-        if state is None:
-            raise RuntimeError("Failed to initialize SatNet state")
-        self.scenario = SatNetScenario.from_state(state)
-
-        self._tools: dict[str, Callable[..., Any]] = {
-            "list_unsatisfied_requests": self.list_unsatisfied_requests,
-            "get_antenna_status": self.get_antenna_status,
-            "find_view_periods": self.find_view_periods,
-            "schedule_track": self.schedule_track,
-            "unschedule_track": self.unschedule_track,
+        all_tools: dict[str, Callable[..., Any]] = {
+            "query_satellites": self.query_satellites,
+            "query_targets": self.query_targets,
+            "query_stations": self.query_stations,
+            "register_strips": self.register_strips,
+            "unregister_strips": self.unregister_strips,
+            "query_strips": self.query_strips,
+            "compute_strip_windows": self.compute_strip_windows,
+            "query_windows": self.query_windows,
+            "query_actions": self.query_actions,
+            "compute_lighting_windows": self.compute_lighting_windows,
+            "get_ground_track": self.get_ground_track,
+            "evaluate_comms_latency": self.evaluate_comms_latency,
+            "compute_access_windows": self.compute_access_windows,
+            "stage_action": self.stage_action,
+            "unstage_action": self.unstage_action,
             "get_plan_status": self.get_plan_status,
             "commit_plan": self.commit_plan,
-            "reset": self.reset,
+            "reset_plan": self.reset_plan,
+            "evaluate_revisit_gaps": self.evaluate_revisit_gaps,
+            "evaluate_stereo_coverage": self.evaluate_stereo_coverage,
+            "evaluate_polygon_coverage": self.evaluate_polygon_coverage,
             "wait": self.wait,
         }
+        self.allowed_tools = set(allowed_tools or all_tools.keys())
+        self._tools = {name: tool for name, tool in all_tools.items() if name in self.allowed_tools}
+
+    def _new_scenario(self) -> Scenario:
+        return Scenario(
+            satellite_file=str(self.case_dir / "satellites.yaml"),
+            target_file=str(self.case_dir / "targets.yaml"),
+            station_file=str(self.case_dir / "stations.yaml"),
+            plan_file=str(self.case_dir / "initial_plan.json"),
+        )
+
+    def _restore_snapshot(self, snapshot: dict[str, Any]) -> None:
+        self.scenario = Scenario.from_state(
+            satellite_file=str(self.case_dir / "satellites.yaml"),
+            target_file=str(self.case_dir / "targets.yaml"),
+            station_file=str(self.case_dir / "stations.yaml"),
+            plan_file=str(self.case_dir / "initial_plan.json"),
+            state_dict=snapshot,
+        )
 
     def _persist(self) -> None:
-        self.state_file.write(self.scenario.to_state())
+        self.state_file.write(self.scenario.export_to_state())
 
     def invoke(self, name: str, arguments: dict[str, Any]) -> Any:
         if name not in self._tools:
-            return {"error": f"Unknown tool: {name}"}
+            return {"error": f"Tool '{name}' is not enabled for this benchmark."}
         return self._tools[name](**arguments)
 
-    def _format_request_summary(self, req: Any) -> str:
-        return f"{req.request_id}: {req.remaining_hours:.1f}h remaining (min {req.min_duration_hours:.1f}h)"
+    def query_satellites(self, filters: dict[str, Any] | None = None, offset: int = 0, limit: int = 10) -> Any:
+        all_sats = self.scenario.query_satellites()
+        filtered = filter_items(all_sats, filters or {}, satellite_filter_key)
+        paged = paginate(filtered, offset, limit)
+        results = [satellite_summary_key(sat) for sat in paged]
+        if len(filtered) > offset + len(results):
+            return {"satellites": results, "warning": f"Showing {len(results)} of {len(filtered)} matches."}
+        return results
 
-    def _format_view_period(self, vp: Any) -> dict[str, Any]:
-        return {
-            "antenna": vp.antenna,
-            "start_seconds": vp.start_seconds,
-            "end_seconds": vp.end_seconds,
-            "duration_hours": vp.duration_hours,
-        }
+    def query_targets(self, filters: dict[str, Any] | None = None, offset: int = 0, limit: int = 10) -> Any:
+        all_targets = self.scenario.query_targets()
+        filtered = filter_items(all_targets, filters or {}, target_key)
+        paged = paginate(filtered, offset, limit)
+        results = [to_llm_dict(target) for target in paged]
+        if len(filtered) > offset + len(results):
+            return {"targets": results, "warning": f"Showing {len(results)} of {len(filtered)} matches."}
+        return results
 
-    def _format_track(self, track: Any) -> dict[str, Any]:
-        return {
-            "action_id": track.action_id,
-            "request_id": track.request_id,
-            "mission_id": track.mission_id,
-            "antenna": track.antenna,
-            "trx_on": track.trx_on,
-            "trx_off": track.trx_off,
-            "setup_start": track.setup_start,
-            "teardown_end": track.teardown_end,
-            "duration_hours": round(track.duration_hours, 3),
-        }
+    def query_stations(self, filters: dict[str, Any] | None = None, offset: int = 0, limit: int = 10) -> Any:
+        all_stations = self.scenario.query_stations()
+        filtered = filter_items(all_stations, filters or {}, station_key)
+        paged = paginate(filtered, offset, limit)
+        results = [to_llm_dict(station) for station in paged]
+        if len(filtered) > offset + len(results):
+            return {"stations": results, "warning": f"Showing {len(results)} of {len(filtered)} matches."}
+        return results
 
-    def list_unsatisfied_requests(self, offset: int = 0, limit: int = 20) -> dict[str, Any]:
-        requests = self.scenario.list_unsatisfied_requests()
-        page = requests[offset:offset + limit]
-        items = []
-        for req in page:
-            items.append({
-                "request_id": req.request_id,
-                "mission_id": req.mission_id,
-                "total_required_hours": req.total_required_hours,
-                "remaining_hours": req.remaining_hours,
-                "min_duration_hours": req.min_duration_hours,
-                "setup_seconds": req.setup_seconds,
-                "teardown_seconds": req.teardown_seconds,
-                "summary": self._format_request_summary(req),
-            })
-        return {
-            "total": len(requests),
-            "offset": offset,
-            "limit": limit,
-            "items": items,
-        }
+    def register_strips(self, strips: list[dict[str, Any]]) -> Any:
+        registered = self.scenario.register_strips(strips)
+        self._persist()
+        return [strip_key(strip) for strip in registered]
 
-    def get_antenna_status(self, include_blocked_ranges: bool = False) -> dict[str, Any]:
-        status = self.scenario.get_antenna_status()
-        result = {}
-        for antenna, item in status.items():
-            entry = {
-                "hours_available": item.hours_available,
-                "summary": f"{antenna}: {item.hours_available:.1f}h available",
-            }
-            if include_blocked_ranges:
-                entry["blocked_ranges"] = item.blocked_ranges
-            result[antenna] = entry
-        return result
+    def unregister_strips(self, strip_ids: list[str]) -> Any:
+        self.scenario.unregister_strips(strip_ids)
+        self._persist()
+        return {"status": "success", "removed": strip_ids}
 
-    def find_view_periods(
+    def query_strips(self, offset: int = 0, limit: int = 10) -> Any:
+        strips = self.scenario.query_strips()
+        paged = paginate(strips, offset, limit)
+        results = [strip_key(strip) for strip in paged]
+        if len(strips) > offset + len(results):
+            return {"strips": results, "warning": f"Showing {len(results)} of {len(strips)} strips."}
+        return results
+
+    def compute_strip_windows(
         self,
-        request_id: str,
-        min_duration_hours: float = 0,
+        sat_ids: list[str],
+        strip_ids: list[str],
+        start_time: str,
+        end_time: str,
+        constraints: list[dict[str, Any]] | None = None,
         offset: int = 0,
         limit: int = 10,
-    ) -> dict[str, Any]:
-        try:
-            vps = self.scenario.find_view_periods(request_id, min_duration_hours)
-        except SatNetNotFoundError as exc:
-            return {"error": str(exc), "status": 6523}
+    ) -> Any:
+        warning = None
+        if len(sat_ids) > 1 and len(strip_ids) > 1:
+            warning = (
+                f"Multiple satellites ({len(sat_ids)}) and multiple strips ({len(strip_ids)}) provided. "
+                f"Only the first strip '{strip_ids[0]}' will be used."
+            )
+            strip_ids = [strip_ids[0]]
 
-        page = vps[offset:offset + limit]
+        windows = self.scenario.compute_strip_windows(sat_ids, strip_ids, start_time, end_time, constraints=constraints)
+        registered = self.scenario.register_windows(windows)
+        self._persist()
+        paged = paginate(registered, offset, min(limit, 20))
+        results = [window_summary_key(window) for window in paged]
+
+        warnings = []
+        if warning:
+            warnings.append(warning)
+        if len(registered) > offset + len(results):
+            warnings.append(f"Showing {len(results)} of {len(registered)} windows.")
+        if warnings:
+            return {"warning": " | ".join(warnings), "windows": results}
+        return results
+
+    def query_windows(self, filters: dict[str, Any] | None = None, offset: int = 0, limit: int = 10) -> Any:
+        windows = self.scenario.query_windows()
+        if filters:
+            filter_dicts = [window_filter_key(window) for window in windows]
+            indices = [idx for idx, item in enumerate(filter_dicts) if record_matches_filters(item, filters)]
+            windows = [windows[idx] for idx in indices]
+        paged = paginate(windows, offset, min(limit, 20))
+        results = [window_summary_key(window) for window in paged]
+        if len(windows) > offset + len(results):
+            return {"windows": results, "warning": f"Showing {len(results)} of {len(windows)} windows."}
+        return results
+
+    def query_actions(self, filters: dict[str, Any] | None = None, offset: int = 0, limit: int = 10) -> Any:
+        action_dicts = [action_key(action) for action in self.scenario.query_actions()]
+        if filters:
+            action_dicts = [item for item in action_dicts if record_matches_filters(item, filters)]
+        paged = paginate(action_dicts, offset, min(limit, 20))
+        results = [to_llm_dict(item) for item in paged]
+        if len(action_dicts) > offset + len(results):
+            return {"actions": results, "warning": f"Showing {len(results)} of {len(action_dicts)} actions."}
+        return results
+
+    def compute_lighting_windows(
+        self,
+        sat_ids: list[str],
+        start_time: str,
+        end_time: str,
+        offset: int = 0,
+        limit: int = 10,
+    ) -> Any:
+        windows = self.scenario.compute_lighting_windows(sat_ids, start_time, end_time)
+        paged = paginate(windows, offset, min(limit, 20))
+        results = [to_llm_dict(window) for window in paged]
+        if len(windows) > offset + len(results):
+            return {"lighting_windows": results, "warning": f"Showing {len(results)} of {len(windows)} windows."}
+        return results
+
+    def get_ground_track(
+        self,
+        satellite_id: str,
+        start_time: str,
+        end_time: str,
+        step_sec: float = 60.0,
+        filter_polygon: list[list[float]] | None = None,
+        offset: int = 0,
+        limit: int = 100,
+    ) -> Any:
+        polygon = None
+        if filter_polygon:
+            polygon = [(pt[0], pt[1]) for pt in filter_polygon]
+        points = self.scenario.get_ground_track(
+            satellite_id,
+            start_time,
+            end_time,
+            step_sec=step_sec,
+            filter_polygon=polygon,
+        )
+        total_count = len(points)
+        paged = paginate(points, offset, min(limit, 200))
+        results = [
+            {
+                "lat": round(point.lat, 4),
+                "lon": round(point.lon, 4),
+                "time": point.time.isoformat(),
+            }
+            for point in paged
+        ]
+        if total_count > offset + len(results):
+            return {
+                "points": results,
+                "total_count": total_count,
+                "returned_count": len(results),
+                "warning": f"Showing {len(results)} of {total_count} points.",
+            }
+        return results
+
+    def evaluate_comms_latency(
+        self,
+        source_station_id: str,
+        dest_station_id: str,
+        start_time: str,
+        end_time: str,
+        sample_step_sec: float = 60.0,
+    ) -> Any:
+        result = self.scenario.evaluate_comms_latency(
+            source_station_id,
+            dest_station_id,
+            start_time,
+            end_time,
+            sample_step_sec,
+        )
+        formatted_windows = []
+        total_established_sec = 0.0
+        for window in result.windows:
+            total_established_sec += window.duration_sec
+            latencies = [sample.latency_ms for sample in window.latency_samples]
+            formatted_windows.append(
+                {
+                    "path": " > ".join(window.path),
+                    "start": window.start.isoformat(),
+                    "end": window.end.isoformat(),
+                    "duration_sec": round(window.duration_sec, 1),
+                    "latency_min_ms": round(min(latencies), 2) if latencies else None,
+                    "latency_max_ms": round(max(latencies), 2) if latencies else None,
+                    "latency_mean_ms": round(sum(latencies) / len(latencies), 2) if latencies else None,
+                    "sample_count": len(latencies),
+                }
+            )
         return {
-            "total": len(vps),
-            "offset": offset,
-            "limit": limit,
-            "items": [self._format_view_period(vp) for vp in page],
-            "hint": f"Found {len(vps)} scheduling opportunities. Windows are sorted by duration (longest first).",
+            "window_count": len(formatted_windows),
+            "total_duration_minutes": round(total_established_sec / 60.0, 2),
+            "windows": formatted_windows,
         }
 
-    def schedule_track(
+    def compute_access_windows(
         self,
-        request_id: str,
-        antenna: str,
-        trx_on: int,
-        trx_off: int,
-        dry_run: bool = False,
-    ) -> dict[str, Any]:
+        sat_ids: list[str],
+        start_time: str,
+        end_time: str,
+        target_ids: list[str] | None = None,
+        station_ids: list[str] | None = None,
+        peer_satellite_ids: list[str] | None = None,
+        constraints: list[dict[str, Any]] | None = None,
+        offset: int = 0,
+        limit: int = 10,
+    ) -> Any:
+        windows = self.scenario.compute_access_windows(
+            sat_ids,
+            target_ids,
+            station_ids,
+            peer_satellite_ids,
+            start_time,
+            end_time,
+            constraints=constraints,
+        )
+        registered = self.scenario.register_windows(windows)
+        self._persist()
+        paged = paginate(registered, offset, min(limit, 20))
+        results = [window_summary_key(window) for window in paged]
+        if len(registered) > offset + len(results):
+            return {"windows": results, "warning": f"Showing {len(results)} of {len(registered)} windows."}
+        return results
+
+    def stage_action(self, action: dict[str, Any], dry_run: bool = False) -> Any:
         try:
             if dry_run:
-                self.scenario._validate_track(request_id, antenna, trx_on, trx_off)
+                snapshot = self.scenario.export_to_state()
+                horizon_start = self.scenario.horizon_start
+                horizon_end = self.scenario.horizon_end
+                result = self.scenario.stage_action(action)
+                status = self.scenario.get_plan_status()
+                self._restore_snapshot(snapshot)
                 return {
-                    "status": 0,
-                    "dry_run": True,
-                    "message": "Validation successful - track would be accepted",
+                    "action_id": result.action_id,
+                    "status": "feasible",
+                    "projected_status": to_llm_dict(format_plan_status(status, horizon_start, horizon_end)),
                 }
 
-            result = self.scenario.schedule_track(request_id, antenna, trx_on, trx_off)
+            result = self.scenario.stage_action(action)
             self._persist()
-            duration_h = result.track.duration_hours
-            buffer_h = (result.track.teardown_end - result.track.setup_start) / 3600 - duration_h
+            return {"action_id": result.action_id, "status": "staged"}
+        except (ValidationError, ConflictError, ResourceViolationError) as exc:
+            return {"feasible": False, "reason": str(exc)}
+
+    def unstage_action(self, action_id: str, dry_run: bool = False) -> Any:
+        if action_id not in self.scenario.staged_actions:
+            return {"status": "error", "reason": f"Action '{action_id}' not found"}
+        if dry_run:
+            snapshot = self.scenario.export_to_state()
+            horizon_start = self.scenario.horizon_start
+            horizon_end = self.scenario.horizon_end
+            self.scenario.unstage_action(action_id)
+            status = self.scenario.get_plan_status()
+            self._restore_snapshot(snapshot)
             return {
-                "action_id": result.action_id,
-                "track": self._format_track(result.track),
-                "status": 0,
-                "dry_run": False,
-                "summary": f"Scheduled {duration_h:.2f}h track (+ {buffer_h:.2f}h setup/teardown buffer)",
-            }
-        except SatNetNotFoundError as exc:
-            return {
-                "error": str(exc),
-                "status": 6523,
-                "suggestion": "Check request_id from list_unsatisfied_requests()",
-            }
-        except SatNetValidationError as exc:
-            return {
-                "error": str(exc),
-                "status": 8794,
-                "suggestion": "Use find_view_periods() to get valid scheduling windows",
-            }
-        except SatNetConflictError as exc:
-            return {
-                "error": str(exc),
-                "status": 8800,
-                "suggestion": "Choose a different time or antenna with no conflicts",
+                "action_id": action_id,
+                "status": "can_unstage",
+                "projected_status": to_llm_dict(format_plan_status(status, horizon_start, horizon_end)),
             }
 
-    def unschedule_track(self, action_id: str, dry_run: bool = False) -> dict[str, Any]:
-        try:
-            if dry_run:
-                if action_id not in self.scenario.get_plan_status().tracks:
-                    raise SatNetNotFoundError(f"Track not found: {action_id}")
-                return {"status": 0, "dry_run": True, "message": "Track exists and can be unscheduled"}
-
-            self.scenario.unschedule_track(action_id)
-            self._persist()
-            return {"status": 0, "dry_run": False}
-        except SatNetNotFoundError as exc:
-            return {"error": str(exc), "status": 6523}
-
-    def get_plan_status(self) -> dict[str, Any]:
-        status = self.scenario.get_plan_status()
-        tracks = [self._format_track(track) for track in status.tracks.values()]
-        metrics = None
-        if status.metrics:
-            metrics = {
-                "total_allocated_hours": status.metrics.total_allocated_hours,
-                "requests_satisfied": status.metrics.requests_satisfied,
-                "requests_unsatisfied": status.metrics.requests_unsatisfied,
-                "u_max": status.metrics.u_max,
-                "u_rms": status.metrics.u_rms,
-            }
-        return {
-            "num_tracks": len(tracks),
-            "tracks": tracks,
-            "metrics": metrics,
-        }
-
-    def commit_plan(self) -> dict[str, Any]:
-        result = self.scenario.commit_plan(str(self.output_path))
+        result = self.scenario.unstage_action(action_id)
         self._persist()
+        return {"action_id": result.action_id, "status": "unstaged"}
+
+    def get_plan_status(self) -> Any:
+        status = self.scenario.get_plan_status()
+        return to_llm_dict(format_plan_status(status, self.scenario.horizon_start, self.scenario.horizon_end))
+
+    def commit_plan(self) -> Any:
+        result = self.scenario.commit_plan(path=str(self.output_path))
+        self._persist()
+        satellites = [format_satellite_summary(metrics) for metrics in result.metrics.satellites.values()]
+        violations = [
+            {
+                "action_id": violation.action_id,
+                "type": violation.violation_type,
+                "message": violation.message,
+                "conflicting_action_ids": violation.conflicting_action_ids,
+            }
+            for violation in result.violations
+        ]
         return {
-            "total_allocated_hours": result.metrics.total_allocated_hours,
-            "requests_satisfied": result.metrics.requests_satisfied,
-            "requests_unsatisfied": result.metrics.requests_unsatisfied,
-            "u_max": result.metrics.u_max,
-            "u_rms": result.metrics.u_rms,
+            "valid": result.valid,
+            "violations": violations if violations else None,
+            "action_count": result.metrics.total_actions,
+            "total_observations": result.metrics.total_observations,
+            "total_downlinks": result.metrics.total_downlinks,
+            "satellites": satellites,
             "plan_json_path": result.plan_json_path,
         }
 
-    def reset(self) -> dict[str, Any]:
-        self.scenario.reset()
+    def reset_plan(self) -> Any:
+        self.scenario.reset_plan()
         self._persist()
-        return {"status": "reset"}
+        return {"status": "reset", "message": "Plan reset to initial state"}
 
-    def wait(self, seconds: float) -> dict[str, Any]:
+    def evaluate_revisit_gaps(self, target_ids: list[str], start_time: str | None = None, end_time: str | None = None) -> Any:
+        return [to_llm_dict(item) for item in self.scenario.evaluate_revisit_gaps(target_ids, start_time, end_time)]
+
+    def evaluate_stereo_coverage(self, target_ids: list[str], min_separation_deg: float = 10.0) -> Any:
+        return [to_llm_dict(item) for item in self.scenario.evaluate_stereo_coverage(target_ids, min_separation_deg)]
+
+    def evaluate_polygon_coverage(self, polygon: list[list[float]]) -> Any:
+        poly_tuples = [(point[0], point[1]) for point in polygon]
+        result = to_llm_dict(self.scenario.evaluate_polygon_coverage(poly_tuples))
+        result.pop("coverage_grid", None)
+        return result
+
+    def wait(self, seconds: float) -> Any:
         actual = max(0.0, min(float(seconds), 30.0))
         time.sleep(actual)
         return {"waited": actual}
 
 
-def build_tool_specs() -> list[dict[str, Any]]:
-    return [
-        {
-            "type": "function",
-            "function": {
-                "name": "list_unsatisfied_requests",
-                "description": "List requests that still need DSN time allocation.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "offset": {"type": "integer"},
-                        "limit": {"type": "integer"},
-                    },
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "get_antenna_status",
-                "description": "Inspect DSN antenna availability and optionally blocked ranges.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "include_blocked_ranges": {"type": "boolean"},
-                    },
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "find_view_periods",
-                "description": "Find scheduleable view periods for a request.",
-                "parameters": {
-                    "type": "object",
-                    "required": ["request_id"],
-                    "properties": {
-                        "request_id": {"type": "string"},
-                        "min_duration_hours": {"type": "number"},
-                        "offset": {"type": "integer"},
-                        "limit": {"type": "integer"},
-                    },
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "schedule_track",
-                "description": "Schedule a DSN track into the plan. Use dry_run first if unsure.",
-                "parameters": {
-                    "type": "object",
-                    "required": ["request_id", "antenna", "trx_on", "trx_off"],
-                    "properties": {
-                        "request_id": {"type": "string"},
-                        "antenna": {"type": "string"},
-                        "trx_on": {"type": "integer"},
-                        "trx_off": {"type": "integer"},
-                        "dry_run": {"type": "boolean"},
-                    },
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "unschedule_track",
-                "description": "Remove a previously scheduled DSN track.",
-                "parameters": {
-                    "type": "object",
-                    "required": ["action_id"],
-                    "properties": {
-                        "action_id": {"type": "string"},
-                        "dry_run": {"type": "boolean"},
-                    },
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "get_plan_status",
-                "description": "Inspect current SatNet schedule metrics and scheduled tracks.",
-                "parameters": {"type": "object", "properties": {}},
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "commit_plan",
-                "description": "Finalize and export the current SatNet plan to plan.json.",
-                "parameters": {"type": "object", "properties": {}},
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "reset",
-                "description": "Reset the current SatNet schedule to empty state.",
-                "parameters": {"type": "object", "properties": {}},
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "wait",
-                "description": "Sleep briefly if needed.",
-                "parameters": {
-                    "type": "object",
-                    "required": ["seconds"],
-                    "properties": {"seconds": {"type": "number"}},
-                },
-            },
-        },
-    ]
+__all__ = ["PlannerToolRegistry", "build_tool_specs", "get_allowed_tool_names"]

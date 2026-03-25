@@ -1,1 +1,1 @@
-"""Custom local SatNet benchmark agent components."""
+"""Custom local benchmark agent components."""

@@ -1,4 +1,4 @@
-"""Prompt loading helpers for the SatNet local benchmark agent."""
+"""Prompt loading helpers for the local benchmark agent."""
 
 from pathlib import Path
 
@@ -6,9 +6,15 @@ PROMPT_DIR = Path(__file__).parent / "prompts"
 
 
 def load_system_prompt() -> str:
+    """Load the fixed system prompt from disk."""
     return (PROMPT_DIR / "system_prompt.txt").read_text(encoding="utf-8")
 
 
-def build_user_prompt(mission_brief: str) -> str:
+def build_user_prompt(mission_brief: str, benchmark_type: str, tool_summary: str) -> str:
+    """Render the user prompt with the mission brief and available tool summary."""
     template = (PROMPT_DIR / "user_prompt.txt").read_text(encoding="utf-8")
-    return template.format(mission_brief=mission_brief)
+    return template.format(
+        mission_brief=mission_brief,
+        benchmark_type=benchmark_type,
+        tool_summary=tool_summary,
+    )
