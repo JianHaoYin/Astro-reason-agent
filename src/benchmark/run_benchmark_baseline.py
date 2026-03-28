@@ -62,6 +62,7 @@ def run_single_case(
     agent_result = agent.run(sandbox_dir=sandbox_dir, output_dir=output_dir)
 
     score = score_result(benchmark, sandbox_dir, case_id)
+    #TODO：返回是空
     key_metrics = extract_key_metrics(benchmark, score)
 
     result = {

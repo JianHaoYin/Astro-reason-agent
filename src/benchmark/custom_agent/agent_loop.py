@@ -43,6 +43,7 @@ class LocalPlanningAgent:
 
     def _load_benchmark_type(self, sandbox_dir: Path) -> str:
         manifest_path = sandbox_dir / "data" / "manifest.json"
+        #TODO:error dou assert
         if not manifest_path.exists():
             return DEFAULT_BENCHMARK_TYPE
         try:
@@ -107,12 +108,12 @@ class LocalPlanningAgent:
         )
         self._append_parsed_log(parsed_log_path, "USER", planning_messages[-1]["content"])
 
-        request_payload = {
+        
+        self._append_jsonl(model_requests_path, {
             "phase": "schedule_planning",
             "messages": planning_messages,
             "tools": [],
-        }
-        self._append_jsonl(model_requests_path, request_payload)
+        })
 
         response = self.client.create_chat_completion(messages=planning_messages, tools=[])
         self._append_jsonl(model_responses_path, {"phase": "schedule_planning", "response": response})
@@ -120,6 +121,7 @@ class LocalPlanningAgent:
         message = response["choices"][0]["message"]
         transcript.append({"phase": "schedule_planning", "assistant": message})
 
+        #TODO：不要if判断错误
         reasoning = message.get("reasoning") or ""
         if isinstance(reasoning, str) and reasoning.strip():
             self._append_parsed_log(parsed_log_path, "ASSISTANT", f"🧠 [思考过程]:\n{reasoning.strip()}")
@@ -130,6 +132,7 @@ class LocalPlanningAgent:
 
     def run(self, sandbox_dir: Path, output_dir: Path) -> dict[str, Any]:
         mission_brief = (sandbox_dir / "workspace" / "mission_brief.md").read_text(encoding="utf-8")
+        #TODO: 这些不能暴露给agent
         benchmark_type = self._load_benchmark_type(sandbox_dir)
         allowed_tool_names = get_allowed_tool_names(benchmark_type)
         registry = PlannerToolRegistry(sandbox_dir, allowed_tools=allowed_tool_names)
